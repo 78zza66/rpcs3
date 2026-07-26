@@ -6,16 +6,6 @@
 #include "Emu/Io/usio_config.h"
 #include "Emu/IdManager.h"
 
-#include <deque>
-#include <mutex>
-
-// Populated by keyboard_pad_handler::process() on each raw button-press edge;
-// drained here in translate_input_taiko() so hits that are pressed and
-// released faster than USIO's own poll cadence aren't lost between reads.
-// Indexed [player][lane], lane 0-3 = left rim, left face, right face, right rim.
-std::deque<int> g_taiko_queue[2][4];
-std::mutex g_taiko_mutex;
-
 LOG_CHANNEL(usio_log, "USIO");
 
 template <>
@@ -226,14 +216,15 @@ void usb_device_usio::translate_input_taiko()
 	std::vector<u8> input_buf(0x60);
 	le_t<u16> digital_input = 0;
 
-	// Taiko hit queue: raw hits are captured per-frame in keyboard_pad_handler::process()
-	// (which polls at a tighter cadence than this function is called at) into
-	// g_taiko_queue, so a hit that is pressed and released between two USIO reads
-	// still gets delivered instead of being silently dropped.
-	// Each drained hit toggles the reported analog value between two adjacent
-	// levels (rather than writing a single fixed "hit" constant), since some
-	// games only recognize a *new* hit when the value changes rather than stays high.
+	// Taiko hits: each hit is written the instant its rising edge is seen here
+	// (no queue, no extra frame of latency). To let games detect consecutive
+	// hits as separate events even if the previous value is still being read,
+	// the reported analog level alternates between two adjacent values (50/51)
+	// instead of writing one fixed "hit" constant every time.
+	// last_pressed tracks the previous frame's press state per player/lane so
+	// we only fire on press, not on every frame the button is held.
 	static bool value_states[2][4] = {};
+	static bool last_pressed[2][4] = {};
 
 	const auto fire_hit = [&](u8* ptr, usz player, usz lane)
 	{
@@ -259,6 +250,17 @@ void usb_device_usio::translate_input_taiko()
 			const auto& cfg = ::at32(g_cfg_usio.players, pad_number);
 			cfg->handle_input(pad, false, [&](const auto& value, bool& /*abort*/)
 			{
+				const auto fire_if_new_press = [&](usz lane, usz byte_offset)
+				{
+					if (player >= 2)
+						return;
+
+					bool& prev = last_pressed[player][lane];
+					if (value.pressed && !prev)
+						fire_hit(input_buf.data() + byte_offset + offset, player, lane);
+					prev = value.pressed;
+				};
+
 				switch (value.btn)
 				{
 				case usio_btn::test:
@@ -289,45 +291,40 @@ void usb_device_usio::translate_input_taiko()
 					if (player == 0 && value.pressed)
 						digital_input |= 0x1000;
 					break;
+				case usio_btn::taiko_hit_side_left:
+					fire_if_new_press(0, 32);
+					break;
+				case usio_btn::taiko_hit_center_left:
+					fire_if_new_press(1, 34);
+					break;
+				case usio_btn::taiko_hit_center_right:
+					fire_if_new_press(2, 36);
+					break;
+				case usio_btn::taiko_hit_side_right:
+					fire_if_new_press(3, 38);
+					break;
 				case usio_btn::card_tapping:
 					if (value.pressed)
 						tap_card(player);
 					break;
 				default:
-					// Taiko hits (usio_btn::taiko_hit_*) are no longer applied directly here;
-					// they are drained from g_taiko_queue below instead.
 					break;
 				}
 			});
 		}
 		else if (player < 2)
 		{
-			// Controller disconnected: drop any queued hits and reset the toggle state
-			// so a reconnect doesn't replay stale hits or start on the wrong value.
-			std::lock_guard<std::mutex> queue_lock(g_taiko_mutex);
+			// Controller disconnected: reset edge/toggle state so a reconnect
+			// doesn't fire a stale hit or start on the wrong alternating value.
 			for (usz lane = 0; lane < 4; lane++)
 			{
 				value_states[player][lane] = false;
-				g_taiko_queue[player][lane].clear();
+				last_pressed[player][lane] = false;
 			}
 		}
 
 		if (player == 0 && status.test_on)
 			digital_input |= 0x80;
-
-		if (player < 2)
-		{
-			std::lock_guard<std::mutex> queue_lock(g_taiko_mutex);
-			for (usz lane = 0; lane < 4; lane++)
-			{
-				auto& queue = g_taiko_queue[player][lane];
-				if (!queue.empty())
-				{
-					queue.pop_front();
-					fire_hit(input_buf.data() + 32 + offset + lane * 2, player, lane);
-				}
-			}
-		}
 	};
 
 	for (usz i = 0; i < m_io_status.size(); i++)
