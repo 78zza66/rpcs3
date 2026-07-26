@@ -6,6 +6,16 @@
 #include "Emu/Io/usio_config.h"
 #include "Emu/IdManager.h"
 
+#include <deque>
+#include <mutex>
+
+// Populated by keyboard_pad_handler::process() on each raw button-press edge;
+// drained here in translate_input_taiko() so hits that are pressed and
+// released faster than USIO's own poll cadence aren't lost between reads.
+// Indexed [player][lane], lane 0-3 = left rim, left face, right face, right rim.
+std::deque<int> g_taiko_queue[2][4];
+std::mutex g_taiko_mutex;
+
 LOG_CHANNEL(usio_log, "USIO");
 
 template <>
@@ -214,8 +224,30 @@ void usb_device_usio::translate_input_taiko()
 	const auto handler = pad::get_pad_thread();
 
 	std::vector<u8> input_buf(0x60);
-	constexpr le_t<u16> c_hit = 0x1800;
 	le_t<u16> digital_input = 0;
+
+	// Taiko hit queue: raw hits are captured per-frame in keyboard_pad_handler::process()
+	// (which polls at a tighter cadence than this function is called at) into
+	// g_taiko_queue, so a hit that is pressed and released between two USIO reads
+	// still gets delivered instead of being silently dropped.
+	// Each drained hit toggles the reported analog value between two adjacent
+	// levels (rather than writing a single fixed "hit" constant), since some
+	// games only recognize a *new* hit when the value changes rather than stays high.
+	static bool value_states[2][4] = {};
+
+	const auto fire_hit = [&](u8* ptr, usz player, usz lane)
+	{
+		if (!ptr)
+			return;
+
+		bool& state = value_states[player][lane];
+		const u16 hit_val = state ? 51 : 50;
+		state = !state;
+
+		const u16 analog_val = (hit_val << 15) / 100 + 1;
+		const le_t<u16> out = analog_val;
+		std::memcpy(ptr, &out, sizeof(u16));
+	};
 
 	const auto translate_from_pad = [&](usz pad_number, usz player)
 	{
@@ -257,34 +289,45 @@ void usb_device_usio::translate_input_taiko()
 					if (player == 0 && value.pressed)
 						digital_input |= 0x1000;
 					break;
-				case usio_btn::taiko_hit_side_left:
-					if (value.pressed)
-						std::memcpy(input_buf.data() + 32 + offset, &c_hit, sizeof(u16));
-					break;
-				case usio_btn::taiko_hit_center_right:
-					if (value.pressed)
-						std::memcpy(input_buf.data() + 36 + offset, &c_hit, sizeof(u16));
-					break;
-				case usio_btn::taiko_hit_side_right:
-					if (value.pressed)
-						std::memcpy(input_buf.data() + 38 + offset, &c_hit, sizeof(u16));
-					break;
-				case usio_btn::taiko_hit_center_left:
-					if (value.pressed)
-						std::memcpy(input_buf.data() + 34 + offset, &c_hit, sizeof(u16));
-					break;
 				case usio_btn::card_tapping:
 					if (value.pressed)
 						tap_card(player);
 					break;
 				default:
+					// Taiko hits (usio_btn::taiko_hit_*) are no longer applied directly here;
+					// they are drained from g_taiko_queue below instead.
 					break;
 				}
 			});
 		}
+		else if (player < 2)
+		{
+			// Controller disconnected: drop any queued hits and reset the toggle state
+			// so a reconnect doesn't replay stale hits or start on the wrong value.
+			std::lock_guard<std::mutex> queue_lock(g_taiko_mutex);
+			for (usz lane = 0; lane < 4; lane++)
+			{
+				value_states[player][lane] = false;
+				g_taiko_queue[player][lane].clear();
+			}
+		}
 
 		if (player == 0 && status.test_on)
 			digital_input |= 0x80;
+
+		if (player < 2)
+		{
+			std::lock_guard<std::mutex> queue_lock(g_taiko_mutex);
+			for (usz lane = 0; lane < 4; lane++)
+			{
+				auto& queue = g_taiko_queue[player][lane];
+				if (!queue.empty())
+				{
+					queue.pop_front();
+					fire_hit(input_buf.data() + 32 + offset + lane * 2, player, lane);
+				}
+			}
+		}
 	};
 
 	for (usz i = 0; i < m_io_status.size(); i++)
