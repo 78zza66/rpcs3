@@ -7,7 +7,16 @@
 #include "rpcs3qt/gs_frame.h"
 
 #include <algorithm>
+#include <deque>
+#include <mutex>
 #include <QApplication>
+
+// Shared with Emu/Io/usio.cpp: raw per-frame taiko hit queue.
+// Captured here (pad polling) instead of in USIO's own translate_input_taiko()
+// so that hits which press and release faster than USIO's own poll cadence
+// are not silently dropped between two USIO reads.
+extern std::deque<int> g_taiko_queue[2][4];
+extern std::mutex g_taiko_mutex;
 
 bool keyboard_pad_handler::Init()
 {
@@ -1342,6 +1351,16 @@ void keyboard_pad_handler::process()
 		}
 	}
 
+	// Taiko hit-queue: tracks each binding's per-button pressed state so we can
+	// detect rising edges here (at pad-poll rate) and queue them for USIO to
+	// drain at its own cadence, instead of relying on a single-sample check
+	// inside translate_input_taiko() that can miss very fast hits.
+	static std::vector<std::vector<bool>> last_pressed_states;
+	if (last_pressed_states.size() < m_bindings.size())
+	{
+		last_pressed_states.resize(m_bindings.size());
+	}
+
 	for (uint i = 0; i < m_bindings.size(); i++)
 	{
 		auto& pad = m_bindings[i].pad;
@@ -1351,6 +1370,46 @@ void keyboard_pad_handler::process()
 		ensure(cfg);
 
 		const Pad& pad_internal = m_pads_internal[i];
+
+		if (pad->m_player_id < 2)
+		{
+			auto& pressed_states = last_pressed_states[i];
+			if (pressed_states.size() < pad_internal.m_buttons.size())
+			{
+				pressed_states.resize(pad_internal.m_buttons.size(), false);
+			}
+
+			for (usz b = 0; b < pad_internal.m_buttons.size(); b++)
+			{
+				const bool is_pressed = pad_internal.m_buttons[b].m_pressed;
+
+				if (is_pressed && !pressed_states[b])
+				{
+					int lane = -1;
+					const u32 code = pad_internal.m_buttons[b].m_outKeyCode;
+
+					// Face buttons: primary taiko hit mapping.
+					// 0: left rim, 1: left face, 2: right face, 3: right rim
+					if (code == CELL_PAD_CTRL_SQUARE)        lane = 0;
+					else if (code == CELL_PAD_CTRL_TRIANGLE) lane = 1;
+					else if (code == CELL_PAD_CTRL_CROSS)    lane = 2;
+					else if (code == CELL_PAD_CTRL_CIRCLE)   lane = 3;
+					// D-pad: secondary/auxiliary mapping.
+					else if (code == CELL_PAD_CTRL_LEFT)     lane = 0;
+					else if (code == CELL_PAD_CTRL_UP)       lane = 1;
+					else if (code == CELL_PAD_CTRL_DOWN)     lane = 2;
+					else if (code == CELL_PAD_CTRL_RIGHT)    lane = 3;
+
+					if (lane != -1)
+					{
+						std::lock_guard<std::mutex> lock(g_taiko_mutex);
+						g_taiko_queue[pad->m_player_id][lane].push_back(1);
+					}
+				}
+
+				pressed_states[b] = is_pressed;
+			}
+		}
 
 		// Normalize and apply pad squircling
 		// Copy sticks first. We don't want to modify the raw internal values
